@@ -47,39 +47,50 @@ if st.button("PDFを結合する", type="primary"):
 
     with st.spinner("GoogleドライブからPDFを取得して結合しています..."):
         try:
-            # サーバー上にファイルが残らないよう一時ディレクトリを作成
             with tempfile.TemporaryDirectory() as temp_dir:
                 # 1. Googleドライブの共有フォルダからファイルを一括ダウンロード
-                downloaded_files = gdown.download_folder(
-                    url=folder_url,
-                    output=temp_dir,
-                    quiet=True,
-                    use_cookies=False
-                )
+                # 一部のファイル（Googleドキュメント等）で失敗しても処理を止めないよう try-except で囲む
+                try:
+                    gdown.download_folder(
+                        url=folder_url,
+                        output=temp_dir,
+                        quiet=True,
+                        use_cookies=False,
+                        remaining_ok=True
+                    )
+                except Exception as dl_err:
+                    st.warning(
+                        f"⚠️ 一部のファイルがダウンロードできませんでした（Googleドキュメント形式やショートカット、権限設定の可能性があります）。"
+                        f"取得できたPDFのみで結合を続行します。\n\n詳細: {dl_err}"
+                    )
 
-                if not downloaded_files:
-                    st.error("フォルダからファイルを取得できませんでした。共有設定が「リンクを知っている全員」になっているか確認してください。")
-                    st.stop()
-
-                # 2. フォルダ内（サブフォルダ含む）のPDFファイルを収集し、ファイル名順にソート
+                # 2. フォルダ内のPDFファイルを収集（「.pdf のコピー」なども含めて判定）
                 pdf_paths = []
                 for root, _, files in os.walk(temp_dir):
                     for f in files:
-                        if f.lower().endswith(".pdf"):
-                            pdf_paths.append(os.path.join(root, f))
+                        # 拡張子が .pdf またはファイル名に .pdf を含む（例: 〇〇.pdf のコピー）場合を対象にする
+                        if ".pdf" in f.lower():
+                            full_path = os.path.join(root, f)
+                            # 実際にPDFとして開けるかチェック
+                            try:
+                                test_doc = fitz.open(full_path)
+                                if test_doc.is_pdf:
+                                    pdf_paths.append(full_path)
+                                test_doc.close()
+                            except Exception:
+                                pass
 
                 # ファイル名（大文字・小文字区別なし）でソート
                 pdf_paths.sort(key=lambda p: os.path.basename(p).lower())
 
                 if not pdf_paths:
-                    st.warning("指定されたフォルダ内にPDFファイルが見つかりませんでした。")
+                    st.error("結合可能なPDFファイルが見つかりませんでした。フォルダの共有設定（「リンクを知っている全員」）や中身を確認してください。")
                     st.stop()
 
                 # 3. 統一したいサイズ（A4）の寸法を取得し、空PDFを作成
                 a4_rect = fitz.paper_rect("a4")
                 doc_out = fitz.open()
 
-                # 進捗バーの表示
                 progress_bar = st.progress(0, text="PDFを結合中...")
 
                 for idx, pdf_path in enumerate(pdf_paths):
@@ -91,9 +102,7 @@ if st.button("PDFを結合する", type="primary"):
 
                     doc_in = fitz.open(pdf_path)
                     for page in doc_in:
-                        # A4サイズの新規ページを作成
                         new_page = doc_out.new_page(width=a4_rect.width, height=a4_rect.height)
-                        # 元のページ内容をA4サイズの中央に自動スケールして貼り付け
                         new_page.show_pdf_page(new_page.rect, doc_in, page.number)
                     doc_in.close()
 
@@ -106,11 +115,11 @@ if st.button("PDFを結合する", type="primary"):
                         quality=int(quality)
                     )
 
-                # 5. ローカル保存(save)の代わりに、メモリ上のバイト列(tobytes)として出力
+                # 5. メモリ上のバイト列として出力
                 pdf_bytes = doc_out.tobytes(
-                    garbage=4,      # 未使用オブジェクトの削除＋重複データの統合
-                    deflate=True,   # ロスレス圧縮
-                    clean=True      # ページの構文構造を整理・最適化
+                    garbage=4,
+                    deflate=True,
+                    clean=True
                 )
                 total_pages = len(doc_out)
                 doc_out.close()
@@ -118,7 +127,7 @@ if st.button("PDFを結合する", type="primary"):
             # --- 完了表示とダウンロードボタン ---
             st.success(f"🎉 {len(pdf_paths)}個のPDFファイル（計 {total_pages} ページ）を結合し、A4サイズに統一しました！")
 
-            with st.expander("結合されたファイル一覧（順番確認）"):
+            with st.expander("結合されたファイル一覧（順番確認）", expanded=True):
                 for i, p in enumerate(pdf_paths, 1):
                     st.write(f"{i}. `{os.path.basename(p)}`")
 
