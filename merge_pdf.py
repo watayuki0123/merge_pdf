@@ -17,7 +17,7 @@ folder_url = st.text_input(
 
 output_filename = st.text_input(
     "2. 出力ファイル名",
-    value="PENA夏休み号2026-v2.pdf"
+    placeholder="pena"
 )
 
 # 元のコードにあった画像圧縮オプションをUIで切り替え可能に
