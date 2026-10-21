@@ -1,41 +1,83 @@
+import io
 import os
 import re
+import time
+import zipfile
 import tempfile
 import streamlit as st
 import fitz  # PyMuPDF
 import gdown
 
 st.set_page_config(page_title="PDF結合＆A4サイズ統一ツール", page_icon="📄")
-st.title("📄 Googleドライブ PDF結合ツール")
-st.write("Googleドライブの共有フォルダ内にあるPDFを名前順に結合し、すべてA4サイズに統一します。")
+st.title("📄 PDF結合＆A4サイズ統一ツール")
 
 
-def natural_sort_key(path):
+def natural_sort_key(name):
     """
-    ファイル名に含まれる数字（0, 0.9, 1, 2, 10など）を数値として扱い、
+    ファイル名に含まれる数字（0, 0.9, 1, 1.9, 1.92, 2...）を数値として扱い、
     自然な順番でソートするためのキー関数
     """
-    filename = os.path.basename(path).lower()
-    parts = re.split(r'(\d+(?:\.\d+)?)', filename)
+    basename = os.path.basename(name).lower()
+    parts = re.split(r'(\d+(?:\.\d+)?)', basename)
     return [float(part) if i % 2 == 1 else part for i, part in enumerate(parts)]
 
 
-# --- UI: 入力フォーム ---
-folder_url = st.text_input(
-    "1. Googleドライブの共有フォルダURL",
-    placeholder="https://drive.google.com/drive/folders/XXXXXXXXXXXXXXXXXXXX?usp=sharing"
-)
+def merge_and_optimize_pdfs(pdf_items, use_compression, dpi_thresh, dpi_targ, qual):
+    """
+    (ファイル名, PDFバイト列) のリストを受け取り、A4統一＆結合してバイト列を返す
+    """
+    a4_rect = fitz.paper_rect("a4")
+    doc_out = fitz.open()
+    progress_bar = st.progress(0, text="PDFを結合中...")
 
-output_filename = st.text_input(
-    "2. 出力ファイル名",
-    placeholder="PENA.pdf"
-)
+    valid_files = []
+    for idx, (fname, pdf_bytes) in enumerate(pdf_items):
+        progress_bar.progress(
+            (idx + 1) / len(pdf_items),
+            text=f"処理中 ({idx + 1}/{len(pdf_items)}): {fname}"
+        )
+        try:
+            doc_in = fitz.open(stream=pdf_bytes, filetype="pdf")
+            if len(doc_in) > 0:
+                for page in doc_in:
+                    new_page = doc_out.new_page(width=a4_rect.width, height=a4_rect.height)
+                    new_page.show_pdf_page(new_page.rect, doc_in, page.number)
+                valid_files.append(fname)
+            doc_in.close()
+        except Exception as e:
+            st.warning(f"⚠️ `{fname}` はPDFとして開けなかったためスキップしました ({e})")
+
+    if len(doc_out) == 0:
+        doc_out.close()
+        return None, 0, []
+
+    if use_compression:
+        progress_bar.progress(1.0, text="埋め込み画像を最適化中...")
+        doc_out.rewrite_images(
+            dpi_threshold=int(dpi_thresh),
+            dpi_target=int(dpi_targ),
+            quality=int(qual)
+        )
+
+    out_bytes = doc_out.tobytes(
+        garbage=4,
+        deflate=True,
+        clean=True
+    )
+    total_pages = len(doc_out)
+    doc_out.close()
+    return out_bytes, total_pages, valid_files
+
+
+# --- 共通設定（出力ファイル名・画像圧縮オプション） ---
+output_filename = st.text_input("出力ファイル名", placeholder="PENA.pdf")
 
 use_image_compression = st.checkbox(
     "埋め込み画像を圧縮してファイルサイズを小さくする（文字やベクター図形の画質は落ちません）",
     value=False
 )
 
+dpi_threshold, dpi_target, quality = 200, 150, 75
 if use_image_compression:
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -45,105 +87,171 @@ if use_image_compression:
     with col3:
         quality = st.slider("JPEG画質 (Quality)", min_value=10, max_value=100, value=75)
 
-# --- 実行ボタン ---
-if st.button("PDFを結合する", type="primary"):
-    if not folder_url:
-        st.error("GoogleドライブのフォルダURLを入力してください。")
-        st.stop()
+st.divider()
 
-    if not output_filename.lower().endswith(".pdf"):
-        output_filename += ".pdf"
+# --- 取得方法の選択タブ ---
+tab1, tab2 = st.tabs([
+    "🚀 方法A: ZIPまたはPDFを直接アップロード（制限なし・確実）",
+    "🔗 方法B: GoogleドライブURLから取得"
+])
 
-    with st.spinner("GoogleドライブからPDFを取得して結合しています..."):
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # 1. Googleドライブの共有フォルダからファイルを一括ダウンロード
-                # 1つのファイルで失敗しても、それまでにダウンロードできたファイルで続行する
-                try:
-                    gdown.download_folder(
-                        url=folder_url,
-                        output=temp_dir,
-                        quiet=True,
-                        use_cookies=True  # 大容量ファイルの取得失敗を防ぐためTrueに設定
-                    )
-                except Exception as dl_err:
-                    st.warning(
-                        f"⚠️ 一部のファイルのダウンロードでエラーが発生しましたが、取得できたファイルで処理を続行します。\n\n"
-                        f"（特定のファイルだけ抜ける場合は、そのファイルのオーナーが学内アカウント等になっていないか確認してください）\n\n"
-                        f"詳細: {dl_err}"
-                    )
+# =====================================================================
+# タブ1: GoogleドライブからダウンロードしたZIPや複数PDFを直接入れる方法
+# =====================================================================
+with tab1:
+    st.markdown(
+        "**Googleドライブのアクセス制限（Failed to downloadエラー）を100%回避できる一番確実な方法です。**\n"
+        "1. Googleドライブで `penaまとめ` フォルダを右クリック ＞ **「ダウンロード」** をクリック（1つの `.zip` ファイルになります）\n"
+        "2. ダウンロードされた **ZIPファイルそのまま**（または中のPDFファイル全部）を下の枠にドラッグ＆ドロップしてください。"
+    )
 
-                # 2. フォルダ内のPDFファイルを収集（「.pdf のコピー」なども含めて判定）
-                pdf_paths = []
-                for root, _, files in os.walk(temp_dir):
-                    for f in files:
-                        if ".pdf" in f.lower():
-                            full_path = os.path.join(root, f)
-                            try:
-                                test_doc = fitz.open(full_path)
-                                if test_doc.is_pdf and len(test_doc) > 0:
-                                    pdf_paths.append(full_path)
-                                test_doc.close()
-                            except Exception:
-                                pass
+    uploaded_files = st.file_uploader(
+        "ZIPファイル または PDFファイル（複数選択可）をここにドロップ",
+        accept_multiple_files=True
+    )
 
-                # 先頭の数字（0, 0.9, 1, 2... 10）を考慮して自然順ソート
-                pdf_paths.sort(key=natural_sort_key)
+    if st.button("アップロードしたファイルを結合する", type="primary", key="btn_upload"):
+        if not uploaded_files:
+            st.error("ファイルをアップロードしてください。")
+            st.stop()
 
-                if not pdf_paths:
-                    st.error("結合可能なPDFファイルが見つかりませんでした。フォルダの共有設定やURLを確認してください。")
-                    st.stop()
+        if not output_filename.lower().endswith(".pdf"):
+            output_filename += ".pdf"
 
-                # 3. 統一したいサイズ（A4）の寸法を取得し、空PDFを作成
-                a4_rect = fitz.paper_rect("a4")
-                doc_out = fitz.open()
+        pdf_items = []
+        for uf in uploaded_files:
+            raw_data = uf.read()
+            # ZIPファイルがアップロードされた場合は自動解凍して中のPDFを探す
+            if uf.name.lower().endswith(".zip") or zipfile.is_zipfile(io.BytesIO(raw_data)):
+                with zipfile.ZipFile(io.BytesIO(raw_data)) as z:
+                    for zinfo in z.infolist():
+                        if not zinfo.is_dir() and ".pdf" in zinfo.filename.lower():
+                            # macOS等の隠しファイルを除外
+                            if "__MACOSX" not in zinfo.filename:
+                                fname = os.path.basename(zinfo.filename)
+                                pdf_items.append((fname, z.read(zinfo.filename)))
+            elif ".pdf" in uf.name.lower():
+                pdf_items.append((uf.name, raw_data))
 
-                progress_bar = st.progress(0, text="PDFを結合中...")
+        # 自然順ソート（0 -> 0.9 -> 1 -> 1.9 -> 1.92 -> 2...）
+        pdf_items.sort(key=lambda x: natural_sort_key(x[0]))
 
-                for idx, pdf_path in enumerate(pdf_paths):
-                    pdf_name = os.path.basename(pdf_path)
-                    progress_bar.progress(
-                        (idx + 1) / len(pdf_paths),
-                        text=f"処理中 ({idx + 1}/{len(pdf_paths)}): {pdf_name}"
-                    )
+        if not pdf_items:
+            st.error("PDFファイルが見つかりませんでした。")
+            st.stop()
 
-                    doc_in = fitz.open(pdf_path)
-                    for page in doc_in:
-                        new_page = doc_out.new_page(width=a4_rect.width, height=a4_rect.height)
-                        new_page.show_pdf_page(new_page.rect, doc_in, page.number)
-                    doc_in.close()
+        with st.spinner("PDFを結合・最適化しています..."):
+            out_bytes, total_pages, valid_files = merge_and_optimize_pdfs(
+                pdf_items, use_image_compression, dpi_threshold, dpi_target, quality
+            )
 
-                # 4. オプションONの場合、埋め込み画像を最適化
-                if use_image_compression:
-                    progress_bar.progress(1.0, text="埋め込み画像を最適化中...")
-                    doc_out.rewrite_images(
-                        dpi_threshold=int(dpi_threshold),
-                        dpi_target=int(dpi_target),
-                        quality=int(quality)
-                    )
-
-                # 5. メモリ上のバイト列として出力
-                pdf_bytes = doc_out.tobytes(
-                    garbage=4,
-                    deflate=True,
-                    clean=True
-                )
-                total_pages = len(doc_out)
-                doc_out.close()
-
-            # --- 完了表示とダウンロードボタン ---
-            st.success(f"🎉 {len(pdf_paths)}個のPDFファイル（計 {total_pages} ページ）を結合し、A4サイズに統一しました！")
-
+        if out_bytes:
+            st.success(f"🎉 {len(valid_files)}個のPDFファイル（計 {total_pages} ページ）を結合し、A4サイズに統一しました！")
             with st.expander("結合されたファイル一覧（順番確認）", expanded=True):
-                for i, p in enumerate(pdf_paths, 1):
-                    st.write(f"{i}. `{os.path.basename(p)}`")
+                for i, name in enumerate(valid_files, 1):
+                    st.write(f"{i}. `{name}`")
 
             st.download_button(
                 label="📥 結合したPDFをダウンロード",
-                data=pdf_bytes,
+                data=out_bytes,
                 file_name=output_filename,
-                mime="application/pdf"
+                mime="application/pdf",
+                key="dl_upload"
             )
 
-        except Exception as e:
-            st.error(f"処理中にエラーが発生しました: {e}")
+# =====================================================================
+# タブ2: Googleドライブの共有URLから取得する方法（1ファイルずつ個別取得に改善）
+# =====================================================================
+with tab2:
+    st.caption(
+        "※Googleドライブの仕様上、短時間に連続実行するとGoogle側から一時的なアクセス制限（Failed to download）がかかることがあります。"
+        "その場合は上の「方法A（ZIPアップロード）」を使うと制限なしで即座に結合できます。"
+    )
+    folder_url = st.text_input(
+        "Googleドライブの共有フォルダURL",
+        placeholder="https://drive.google.com/drive/folders/XXXXXXXXXXXXXXXXXXXX?usp=sharing"
+    )
+
+    if st.button("URLからPDFを結合する", type="primary", key="btn_url"):
+        if not folder_url:
+            st.error("GoogleドライブのフォルダURLを入力してください。")
+            st.stop()
+
+        if not output_filename.lower().endswith(".pdf"):
+            output_filename += ".pdf"
+
+        with st.spinner("Googleドライブからファイル一覧を取得しています..."):
+            try:
+                # skip_download=True でファイル一覧（IDと名前）だけを先に取得する
+                file_list = gdown.download_folder(
+                    url=folder_url,
+                    skip_download=True,
+                    quiet=True,
+                    use_cookies=False
+                )
+            except Exception as e:
+                st.error(f"フォルダ情報の取得に失敗しました。しばらく時間を置くか、方法A（ZIPアップロード）をお試しください。\n詳細: {e}")
+                st.stop()
+
+            if not file_list:
+                st.error("フォルダ内のファイル一覧を取得できませんでした。")
+                st.stop()
+
+            # PDFファイルのみを抽出し、先にファイル名順でソート
+            target_files = [f for f in file_list if ".pdf" in os.path.basename(f.path).lower()]
+            target_files.sort(key=lambda f: natural_sort_key(f.path))
+
+            pdf_items = []
+            failed_files = []
+            dl_progress = st.progress(0, text="ファイルを1つずつ安全にダウンロード中...")
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                for idx, f_obj in enumerate(target_files):
+                    fname = os.path.basename(f_obj.path)
+                    dl_progress.progress(
+                        (idx + 1) / len(target_files),
+                        text=f"ダウンロード中 ({idx + 1}/{len(target_files)}): {fname}"
+                    )
+                    out_path = os.path.join(temp_dir, f"{idx}.pdf")
+                    try:
+                        # 1ファイルずつ個別にダウンロード（レート制限回避のため少し間隔を空ける）
+                        res = gdown.download(id=f_obj.id, output=out_path, quiet=True, fuzzy=True)
+                        if res and os.path.exists(out_path):
+                            with open(out_path, "rb") as fp:
+                                pdf_items.append((fname, fp.read()))
+                        else:
+                            failed_files.append(fname)
+                    except Exception:
+                        failed_files.append(fname)
+                    time.sleep(0.5)  # 連続アクセスによるブロックを緩和
+
+            if failed_files:
+                st.warning(
+                    f"⚠️ 以下の {len(failed_files)} 個のファイルはGoogleドライブのアクセス制限により取得できませんでした:\n"
+                    + "\n".join([f"- `{name}`" for name in failed_files])
+                )
+
+            if not pdf_items:
+                st.error(
+                    "現在Googleドライブ側から一時的なダウンロード制限がかかっています。"
+                    "上の **「🚀 方法A: ZIPまたはPDFを直接アップロード」** タブを使えば今すぐ確実に結合できます！"
+                )
+                st.stop()
+
+            out_bytes, total_pages, valid_files = merge_and_optimize_pdfs(
+                pdf_items, use_image_compression, dpi_threshold, dpi_target, quality
+            )
+
+            if out_bytes:
+                st.success(f"🎉 {len(valid_files)}個のPDFファイル（計 {total_pages} ページ）を結合し、A4サイズに統一しました！")
+                with st.expander("結合されたファイル一覧（順番確認）", expanded=True):
+                    for i, name in enumerate(valid_files, 1):
+                        st.write(f"{i}. `{name}`")
+
+                st.download_button(
+                    label="📥 結合したPDFをダウンロード",
+                    data=out_bytes,
+                    file_name=output_filename,
+                    mime="application/pdf",
+                    key="dl_url"
+                )
