@@ -28,7 +28,7 @@ folder_url = st.text_input(
 
 output_filename = st.text_input(
     "2. 出力ファイル名",
-    value="PENA夏休み号2026-v2.pdf"
+    placeholder="PENA.pdf"
 )
 
 use_image_compression = st.checkbox(
