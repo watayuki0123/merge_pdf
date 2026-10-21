@@ -9,6 +9,17 @@ st.set_page_config(page_title="PDF結合＆A4サイズ統一ツール", page_ico
 st.title("📄 Googleドライブ PDF結合ツール")
 st.write("Googleドライブの共有フォルダ内にあるPDFを名前順に結合し、すべてA4サイズに統一します。")
 
+
+def natural_sort_key(path):
+    """
+    ファイル名に含まれる数字（0, 0.9, 1, 2, 10など）を数値として扱い、
+    自然な順番でソートするためのキー関数
+    """
+    filename = os.path.basename(path).lower()
+    parts = re.split(r'(\d+(?:\.\d+)?)', filename)
+    return [float(part) if i % 2 == 1 else part for i, part in enumerate(parts)]
+
+
 # --- UI: 入力フォーム ---
 folder_url = st.text_input(
     "1. Googleドライブの共有フォルダURL",
@@ -17,10 +28,9 @@ folder_url = st.text_input(
 
 output_filename = st.text_input(
     "2. 出力ファイル名",
-    placeholder="pena"
+    value="PENA夏休み号2026-v2.pdf"
 )
 
-# 元のコードにあった画像圧縮オプションをUIで切り替え可能に
 use_image_compression = st.checkbox(
     "埋め込み画像を圧縮してファイルサイズを小さくする（文字やベクター図形の画質は落ちません）",
     value=False
@@ -41,7 +51,6 @@ if st.button("PDFを結合する", type="primary"):
         st.error("GoogleドライブのフォルダURLを入力してください。")
         st.stop()
 
-    # ファイル名の末尾に .pdf がなければ補完
     if not output_filename.lower().endswith(".pdf"):
         output_filename += ".pdf"
 
@@ -49,42 +58,40 @@ if st.button("PDFを結合する", type="primary"):
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 # 1. Googleドライブの共有フォルダからファイルを一括ダウンロード
-                # 一部のファイル（Googleドキュメント等）で失敗しても処理を止めないよう try-except で囲む
+                # 1つのファイルで失敗しても、それまでにダウンロードできたファイルで続行する
                 try:
                     gdown.download_folder(
                         url=folder_url,
                         output=temp_dir,
                         quiet=True,
-                        use_cookies=False,
-                        remaining_ok=True
+                        use_cookies=True  # 大容量ファイルの取得失敗を防ぐためTrueに設定
                     )
                 except Exception as dl_err:
                     st.warning(
-                        f"⚠️ 一部のファイルがダウンロードできませんでした（Googleドキュメント形式やショートカット、権限設定の可能性があります）。"
-                        f"取得できたPDFのみで結合を続行します。\n\n詳細: {dl_err}"
+                        f"⚠️ 一部のファイルのダウンロードでエラーが発生しましたが、取得できたファイルで処理を続行します。\n\n"
+                        f"（特定のファイルだけ抜ける場合は、そのファイルのオーナーが学内アカウント等になっていないか確認してください）\n\n"
+                        f"詳細: {dl_err}"
                     )
 
                 # 2. フォルダ内のPDFファイルを収集（「.pdf のコピー」なども含めて判定）
                 pdf_paths = []
                 for root, _, files in os.walk(temp_dir):
                     for f in files:
-                        # 拡張子が .pdf またはファイル名に .pdf を含む（例: 〇〇.pdf のコピー）場合を対象にする
                         if ".pdf" in f.lower():
                             full_path = os.path.join(root, f)
-                            # 実際にPDFとして開けるかチェック
                             try:
                                 test_doc = fitz.open(full_path)
-                                if test_doc.is_pdf:
+                                if test_doc.is_pdf and len(test_doc) > 0:
                                     pdf_paths.append(full_path)
                                 test_doc.close()
                             except Exception:
                                 pass
 
-                # ファイル名（大文字・小文字区別なし）でソート
-                pdf_paths.sort(key=lambda p: os.path.basename(p).lower())
+                # 先頭の数字（0, 0.9, 1, 2... 10）を考慮して自然順ソート
+                pdf_paths.sort(key=natural_sort_key)
 
                 if not pdf_paths:
-                    st.error("結合可能なPDFファイルが見つかりませんでした。フォルダの共有設定（「リンクを知っている全員」）や中身を確認してください。")
+                    st.error("結合可能なPDFファイルが見つかりませんでした。フォルダの共有設定やURLを確認してください。")
                     st.stop()
 
                 # 3. 統一したいサイズ（A4）の寸法を取得し、空PDFを作成
